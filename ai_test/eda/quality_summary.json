@@ -1,0 +1,10 @@
+{
+  "rows": 600000,
+  "columns": 17,
+  "missing_cells": 0,
+  "duplicate_ids": 0,
+  "duplicates_excluding_id": 0,
+  "history_pdays_previous_disagreements": 21,
+  "balance_negative_count": 83760,
+  "balance_zero_count": 74574
+}
