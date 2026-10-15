@@ -1,19 +1,18 @@
+from pathlib import Path
+
 import pandas as pd
 import numpy as np
 from model import Model
 
 
-
-
 class Cleaner:
-    def __init__(self,X:pd.DataFrame):
+    """执行固定的特征变换，不从预测样本重新学习统计参数。"""
+
+    def __init__(self, X: pd.DataFrame):
         self.X = X
-        self.cleanedX = self.X.copy()
+        self.cleanedX = None
 
-
-
-    def _process_pdays(self,df:pd.DataFrame):
-
+    def _process_pdays(self, df: pd.DataFrame):
         """
         矛盾情况 A：pdays == -1（说自己从未联系过），但 previous = 2（历史联系了 2 次）或者 poutcome = 'failure'（记录了上次失败）。
         矛盾情况 B：pdays == 180（说半年前联系过），但 previous = 0（历史联系次数写着 0）"""
@@ -22,11 +21,14 @@ class Cleaner:
         df['contact_gap'] = np.where(df['pdays'] == -1, 0, df['pdays'])
 
         # 2. 标记冲突行
-        conflict_mask = ((df['pdays'] == -1) & ((df['previous'] > 0) | (df['poutcome'] != 'unknown'))) | ((df['pdays'] != -1) & (df['previous'] == 0))
+        conflict_mask = (
+            ((df['pdays'] == -1)
+             & ((df['previous'] > 0) | (df['poutcome'] != 'unknown')))
+            | ((df['pdays'] != -1) & (df['previous'] == 0))
+        )
         df['is_contact_conflict'] = conflict_mask.astype(int)
 
-
-    def _process_big_data(self,df:pd.DataFrame):
+    def _process_big_data(self, df: pd.DataFrame):
         # 1. balance 对称对数变换
         df['balance_symlog'] = np.sign(df['balance']) * np.log1p(
             np.abs(df['balance'])
@@ -36,14 +38,14 @@ class Cleaner:
         for col in ['duration', 'campaign', 'previous']:
             df[f'{col}_log'] = np.log1p(df[col])
 
-
-
-
-    def clean(self):
+    def clean(self, feature_columns=None):
+        """返回清洗后的特征；预测时传入训练列名，对齐列数和顺序。"""
+        # 从原始输入重新处理，重复调用也不会再次编码已处理的列。
+        # 测试脚本即使传入整张表，标签和编号也不会进入模型特征。
+        self.cleanedX = self.X.drop(columns=['id', 'age'], errors='ignore').copy()
 
         # 处理很大的数据 见 ai_test/长尾数据处理.md
         self._process_big_data(self.cleanedX)
-
 
         # 处理 Pdays 等字段 见 ai_test/pdays处理.md
         """
@@ -52,41 +54,57 @@ class Cleaner:
         | `has_previous_contact` | 从 `pdays` 提取二值（0/1） | 充当门控，区分新老客户 |
         | `contact_gap` | `pdays` 将 -1 转为 0 | 衡量老客户的时间衰减 |
         | `previous_log` | 对 `previous` 取 `log1p` | 压缩联系次数的长尾极大值（如联系了几十次的情况） |
-        | `poutcome` | 类别编码（如 One-Hot） | 保留上次成败反馈（success 的转化率通常极高） |
-        | `is_contact_conflict` | 逻辑冲突判断（0/1） | 标记脏数据行，防止噪声干扰主干规律 |
+        | `poutcome` | 类别编码（如 One-Hot） | 保留上次营销结果，供模型学习其与年龄的关系 |
+        | `is_contact_conflict` | 逻辑冲突判断（0/1） | 保留冲突标记，不擅自修正原始记录 |
         """
 
         self._process_pdays(self.cleanedX)
 
-
         # 某些字段映射为0，1
-        col_01 = ['default','housing','loan']
+        col_01 = ['default', 'housing', 'loan']
         for col in col_01:
-            self.cleanedX[col] = self.cleanedX[col].map({'yes':1,'no':0})
+            self.cleanedX[col] = self.cleanedX[col].map({'yes': 1, 'no': 0})
+            if self.cleanedX[col].isna().any():
+                raise ValueError(f'{col} 必须为 yes 或 no')
 
         # 对某些字段独热编码
-        dummy_col = ['job','marital','education','contact','month','poutcome']
-        self.cleanedX = pd.get_dummies(self.cleanedX, columns=dummy_col,dtype=int)
+        dummy_col = ['job', 'marital', 'education', 'contact', 'month', 'poutcome']
+        self.cleanedX = pd.get_dummies(self.cleanedX, columns=dummy_col, dtype=np.int8)
 
+        if feature_columns is not None:
+            # 样本中没出现的训练类别补 0；训练未见类别不新增列。
+            # 字符串 unknown 若在训练中出现，仍有自己的独热编码列。
+            self.cleanedX = self.cleanedX.reindex(columns=feature_columns, fill_value=0)
 
-
-
+        return self.cleanedX
 
 
 class Solution:
     def __init__(self):
-        """
-        初始化随机权重示例，供你检查接口；它不是教师评分基线。
-        """
+        """只在初始化时读取训练集、确定预处理参数并训练模型。"""
+        train_path = Path(__file__).resolve().parent / 'train.csv'
+        df = pd.read_csv(train_path)
+        y_train = df['age'].to_numpy(dtype=float)
+
+        # 1. 清洗整个训练集，并记住每一列的含义和顺序。
+        X_clean = Cleaner(df).clean()
+        self.feature_columns = X_clean.columns.tolist()
+        X_train = X_clean.to_numpy(dtype=float)
+        del df, X_clean
+
+        # 2. 只用训练集计算标准化参数，预测时复用。
+        if not np.isfinite(X_train).all():
+            raise ValueError('清洗后的训练特征包含 NaN 或无穷值')
+        self.X_mean = X_train.mean(axis=0)
+        self.X_std = X_train.std(axis=0)
+        # 常量列标准差为 0，改用 1 作除数，中心化后该列仍全为 0。
+        self.X_std[self.X_std == 0] = 1.0
+        X_train -= self.X_mean
+        X_train /= self.X_std
+
+        # 3. 特征维数由清洗结果确定，不再写死为原始的 15 列。
         self.model = Model()
-        np.random.seed(42)
-        n_features = 15
-
-        self.model.weights = np.random.randn(n_features) * 0.01
-        self.model.bias = np.random.randn() * 0.01
-
-        self.X_mean = np.zeros(n_features)
-        self.X_std = np.ones(n_features)
+        self.model.train(X_train, y_train, alpha=1.0)
 
     def forward(self, sample: dict) -> dict:
         """
@@ -98,18 +116,14 @@ class Solution:
         Returns:
             dict: 包含'prediction'键的字典，值为预测的年龄
         """
-        sample_df = pd.DataFrame([sample])
+        # 每个请求使用局部 Cleaner，避免并发预测时互相修改数据。
+        cleaner = Cleaner(pd.DataFrame([sample]))
+        X_clean = cleaner.clean(feature_columns=self.feature_columns)
+        X = X_clean.to_numpy(dtype=float)
+        if not np.isfinite(X).all():
+            raise ValueError('清洗后的预测特征包含 NaN 或无穷值')
 
-        # The evaluator supplies the 15 features; id and age are excluded.
-        X = sample_df.drop(columns=['id', 'age'], errors='ignore')
-
-        for col in X.columns:
-            if X[col].dtype == 'object':
-                X[col] = pd.factorize(X[col])[0]
-
-        X = X.values.astype(float)
-        X = np.nan_to_num(X, nan=0.0)
-
+        # 这里只应用训练参数，不重新计算均值、标准差，也不重新训练。
         X_scaled = (X - self.X_mean) / self.X_std
 
         prediction = self.model.predict(X_scaled)[0]
