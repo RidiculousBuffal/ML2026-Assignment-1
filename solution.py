@@ -1,9 +1,15 @@
+import math
 from contextlib import nullcontext
 from pathlib import Path
 
 import pandas as pd
 import numpy as np
 from model import Model
+
+# 需要独热编码的类别列（与 Cleaner.clean 保持一致）
+DUMMY_COLS = ['job', 'marital', 'education', 'contact', 'month', 'poutcome']
+# 名称以类别列前缀开头、但其实是派生数值列（不是独热列）的字段。
+NON_DUMMY_PREFIXED = {'contact_gap'}
 
 # 本地显示进度；教师环境未安装 tqdm 时仍可正常训练和预测。
 try:
@@ -75,8 +81,7 @@ class Cleaner:
                 raise ValueError(f'{col} 必须为 yes 或 no')
 
         # 对某些字段独热编码
-        dummy_col = ['job', 'marital', 'education', 'contact', 'month', 'poutcome']
-        self.cleanedX = pd.get_dummies(self.cleanedX, columns=dummy_col, dtype=np.int8)
+        self.cleanedX = pd.get_dummies(self.cleanedX, columns=DUMMY_COLS, dtype=np.int8)
 
         if feature_columns is not None:
             # 样本中没出现的训练类别补 0；训练未见类别不新增列。
@@ -129,6 +134,20 @@ class Solution:
                 bar.update(1)
                 bar.set_description('训练完成')
 
+        # 预计算单样本推理所需的映射，避免预测时反复构造 DataFrame / get_dummies。
+        self._col_index = {name: i for i, name in enumerate(self.feature_columns)}
+        self._n_features = len(self.feature_columns)
+        # 每个类别列在训练中出现的取值（只有这些取值才有对应的独热列）。
+        self._onehot_values = {}
+        for name in self.feature_columns:
+            if name in NON_DUMMY_PREFIXED:
+                continue
+            for col in DUMMY_COLS:
+                prefix = col + '_'
+                if name.startswith(prefix):
+                    self._onehot_values.setdefault(col, set()).add(name[len(prefix):])
+                    break
+
     def forward(self, sample: dict) -> dict:
         """
         单样本推理接口
@@ -139,16 +158,56 @@ class Solution:
         Returns:
             dict: 包含'prediction'键的字典，值为预测的年龄
         """
-        # 每个请求使用局部 Cleaner，避免并发预测时互相修改数据。
-        cleaner = Cleaner(pd.DataFrame([sample]))
-        X_clean = cleaner.clean(feature_columns=self.feature_columns)
-        X = X_clean.to_numpy(dtype=float)
-        if not np.isfinite(X).all():
+        # 直接用预计算的映射拼装特征向量，避免每行构造 DataFrame 和 get_dummies。
+        # 逻辑与 Cleaner.clean() 完全等价（列名、顺序、编码方式均一致）。
+        idx = self._col_index
+        v = np.zeros(self._n_features, dtype=float)
+
+        # 1. balance 对称对数变换（_process_big_data）
+        balance = sample['balance']
+        v[idx['balance']] = balance
+        v[idx['balance_symlog']] = math.copysign(math.log1p(abs(balance)), balance)
+
+        # 2. 非负长尾字段 log1p（_process_big_data）
+        for col in ('duration', 'campaign', 'previous'):
+            value = sample[col]
+            v[idx[col]] = value
+            v[idx[col + '_log']] = math.log1p(value)
+
+        # 3. pdays 拆分与冲突标记（_process_pdays）
+        pdays = sample['pdays']
+        previous = sample['previous']
+        poutcome = sample['poutcome']
+        v[idx['pdays']] = pdays
+        v[idx['day']] = sample['day']
+        if pdays != -1:
+            v[idx['has_previous_contact']] = 1
+            v[idx['contact_gap']] = pdays
+        if ((pdays == -1) and (previous > 0 or poutcome != 'unknown')) or \
+                (pdays != -1 and previous == 0):
+            v[idx['is_contact_conflict']] = 1
+
+        # 4. yes/no 映射为 1/0（非法取值与 Cleaner 一样报错）
+        for col in ('default', 'housing', 'loan'):
+            value = sample[col]
+            if value == 'yes':
+                v[idx[col]] = 1
+            elif value == 'no':
+                v[idx[col]] = 0
+            else:
+                raise ValueError(f'{col} 必须为 yes 或 no')
+
+        # 5. 独热编码：只置 1，训练未见类别自然保持全 0（等价 reindex(fill_value=0)）
+        for col, seen in self._onehot_values.items():
+            value = sample[col]
+            if value in seen:
+                v[idx[f'{col}_{value}']] = 1
+
+        if not np.isfinite(v).all():
             raise ValueError('清洗后的预测特征包含 NaN 或无穷值')
 
         # 这里只应用训练参数，不重新计算均值、标准差，也不重新训练。
-        X_scaled = (X - self.X_mean) / self.X_std
-
-        prediction = self.model.predict(X_scaled)[0]
+        X_scaled = (v - self.X_mean) / self.X_std
+        prediction = self.model.predict(X_scaled[None, :])[0]
 
         return {'prediction': float(prediction)}
