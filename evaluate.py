@@ -37,6 +37,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
 EVALUATOR_VERSION = "2026.2.0"
 ASSIGNMENT = "ML2026-Assignment-1"
 DEFAULT_TEST = "test_public.csv"
@@ -100,12 +105,20 @@ def _forward_all(samples):
     t0 = time.perf_counter()
     with ThreadPoolExecutor(max_workers=10) as ex:
         futures = {ex.submit(sol.forward, s): i for i, s in enumerate(samples)}
+        completed = as_completed(futures)
+        # 总样本数由评测器掌握，在此统计完成数，forward 无需修改共享状态。
+        progress = (tqdm(completed, total=n, desc="评估预测", unit="条",
+                         dynamic_ncols=True, mininterval=0.5)
+                    if tqdm is not None else completed)
         try:
-            for fut in as_completed(futures):
+            for fut in progress:
                 results[futures[fut]] = fut.result()
         except Exception as e:
             return None, time.perf_counter() - t0, \
                 "forward 在第 {} 个样本上失败: {}".format(futures[fut], e)
+        finally:
+            if tqdm is not None:
+                progress.close()
     wall = time.perf_counter() - t0
 
     preds = [None] * n
@@ -150,7 +163,8 @@ def _run_worker(samples, timeout):
                                    ensure_ascii=False) + "\n")
         cmd = [sys.executable, os.path.abspath(__file__), "--_worker", workdir]
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True,
+            # tqdm 默认写入 stderr，实时透传；stdout 仍保留作诊断输出。
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, text=True,
                                   encoding="utf-8", errors="ignore",
                                   timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -202,7 +216,7 @@ def main():
                for s in df.drop(columns=["age", "id"], errors='ignore').to_dict("records")]
     y_true = df["age"].to_numpy(dtype=float)
 
-    print("Evaluating {} rows from {} ...".format(len(df), args.test))
+    print("Evaluating {} rows from {} ...".format(len(df), args.test), flush=True)
     out, stdout_tail = _run_worker(samples, args.timeout)
 
     error = out["info"].get("error")

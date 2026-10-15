@@ -1,8 +1,15 @@
+from contextlib import nullcontext
 from pathlib import Path
 
 import pandas as pd
 import numpy as np
 from model import Model
+
+# 本地显示进度；教师环境未安装 tqdm 时仍可正常训练和预测。
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 
 
 class Cleaner:
@@ -82,29 +89,45 @@ class Cleaner:
 class Solution:
     def __init__(self):
         """只在初始化时读取训练集、确定预处理参数并训练模型。"""
-        train_path = Path(__file__).resolve().parent / 'train.csv'
-        df = pd.read_csv(train_path)
-        y_train = df['age'].to_numpy(dtype=float)
+        # 岭回归直接解方程，没有逐轮训练；这里显示四个准备阶段的完成进度。
+        progress = (tqdm(total=4, desc='读取训练集', unit='阶段', dynamic_ncols=True)
+                    if tqdm is not None else nullcontext())
+        with progress as bar:
+            train_path = Path(__file__).resolve().parent / 'train.csv'
+            df = pd.read_csv(train_path)
+            y_train = df['age'].to_numpy(dtype=float)
+            if bar is not None:
+                bar.update(1)
+                bar.set_description('清洗与编码')
 
-        # 1. 清洗整个训练集，并记住每一列的含义和顺序。
-        X_clean = Cleaner(df).clean()
-        self.feature_columns = X_clean.columns.tolist()
-        X_train = X_clean.to_numpy(dtype=float)
-        del df, X_clean
+            # 1. 清洗整个训练集，并记住每一列的含义和顺序。
+            X_clean = Cleaner(df).clean()
+            self.feature_columns = X_clean.columns.tolist()
+            X_train = X_clean.to_numpy(dtype=float)
+            del df, X_clean
+            if bar is not None:
+                bar.update(1)
+                bar.set_description('标准化特征')
 
-        # 2. 只用训练集计算标准化参数，预测时复用。
-        if not np.isfinite(X_train).all():
-            raise ValueError('清洗后的训练特征包含 NaN 或无穷值')
-        self.X_mean = X_train.mean(axis=0)
-        self.X_std = X_train.std(axis=0)
-        # 常量列标准差为 0，改用 1 作除数，中心化后该列仍全为 0。
-        self.X_std[self.X_std == 0] = 1.0
-        X_train -= self.X_mean
-        X_train /= self.X_std
+            # 2. 只用训练集计算标准化参数，预测时复用。
+            if not np.isfinite(X_train).all():
+                raise ValueError('清洗后的训练特征包含 NaN 或无穷值')
+            self.X_mean = X_train.mean(axis=0)
+            self.X_std = X_train.std(axis=0)
+            # 常量列标准差为 0，改用 1 作除数，中心化后该列仍全为 0。
+            self.X_std[self.X_std == 0] = 1.0
+            X_train -= self.X_mean
+            X_train /= self.X_std
+            if bar is not None:
+                bar.update(1)
+                bar.set_description('求解岭回归')
 
-        # 3. 特征维数由清洗结果确定，不再写死为原始的 15 列。
-        self.model = Model()
-        self.model.train(X_train, y_train, alpha=1.0)
+            # 3. 特征维数由清洗结果确定，不再写死为原始的 15 列。
+            self.model = Model()
+            self.model.train(X_train, y_train, alpha=1.0)
+            if bar is not None:
+                bar.update(1)
+                bar.set_description('训练完成')
 
     def forward(self, sample: dict) -> dict:
         """
