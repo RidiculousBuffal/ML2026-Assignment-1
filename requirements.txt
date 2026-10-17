@@ -4,5 +4,7 @@ matplotlib==3.7.2
 seaborn==0.12.2
 plotly==5.17.0
 shap==0.43.0
+# 固定 SHAP 的间接依赖，避免本地 SciPy 1.15.3 的 macOS 二进制加载问题。
+scipy==1.11.4
 requests==2.31.0
 tqdm==4.70.1
