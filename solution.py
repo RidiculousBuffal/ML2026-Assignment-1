@@ -129,7 +129,7 @@ class Solution:
 
             # 3. 特征维数由清洗结果确定，不再写死为原始的 15 列。
             self.model = Model()
-            self.model.train(X_train, y_train, alpha=1.0)
+            self.model.train(X_train, y_train, alpha=1)
             if bar is not None:
                 bar.update(1)
                 bar.set_description('训练完成')
